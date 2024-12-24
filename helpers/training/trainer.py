@@ -1,3 +1,4 @@
+import logging, os
 import huggingface_hub
 from helpers.training.default_settings.safety_check import safety_check
 from helpers.publishing.huggingface import HubManager
@@ -7,15 +8,12 @@ import hashlib
 import json
 import copy
 import random
-import logging
 import math
-import os
 import sys
 import glob
 import wandb
 
-# Quiet down, you.
-os.environ["ACCELERATE_LOG_LEVEL"] = "WARNING"
+
 from helpers import log_format  # noqa
 from helpers.configuration.loader import load_config
 from helpers.caching.memory import reclaim_memory
@@ -96,7 +94,6 @@ from helpers.models.sdxl.pipeline import StableDiffusionXLPipeline
 from diffusers import StableDiffusion3Pipeline
 
 from diffusers import (
-    AutoencoderKL,
     ControlNetModel,
     DDIMScheduler,
     DDPMScheduler,
@@ -157,12 +154,20 @@ diffusers.utils.logging.set_verbosity_warning()
 
 class Trainer:
     def __init__(
-        self, config: dict = None, disable_accelerator: bool = False, job_id: str = None
+        self,
+        config: dict = None,
+        disable_accelerator: bool = False,
+        job_id: str = None,
+        exit_on_error: bool = False,
     ):
         self.accelerator = None
         self.job_id = job_id
         StateTracker.set_job_id(job_id)
-        self.parse_arguments(args=config, disable_accelerator=disable_accelerator)
+        self.parse_arguments(
+            args=config,
+            disable_accelerator=disable_accelerator,
+            exit_on_error=exit_on_error,
+        )
         self._misc_init()
         self.lycoris_wrapped_network = None
         self.lycoris_config = None
@@ -184,8 +189,10 @@ class Trainer:
             return None
         return type("Config", (object,), config)
 
-    def parse_arguments(self, args=None, disable_accelerator: bool = False):
-        self.config = load_config(args)
+    def parse_arguments(
+        self, args=None, disable_accelerator: bool = False, exit_on_error: bool = False
+    ):
+        self.config = load_config(args, exit_on_error=exit_on_error)
         report_to = (
             None if self.config.report_to.lower() == "none" else self.config.report_to
         )
@@ -458,14 +465,19 @@ class Trainer:
             "force_upcast": False,
             "variant": self.config.variant,
         }
+        if StateTracker.get_args().model_family == "sana":
+            from diffusers import AutoencoderDC as AutoencoderClass
+        else:
+            from diffusers import AutoencoderKL as AutoencoderClass
+
         try:
-            self.vae = AutoencoderKL.from_pretrained(**self.config.vae_kwargs)
+            self.vae = AutoencoderClass.from_pretrained(**self.config.vae_kwargs)
         except:
             logger.warning(
                 "Couldn't load VAE with default path. Trying without a subfolder.."
             )
             self.config.vae_kwargs["subfolder"] = None
-            self.vae = AutoencoderKL.from_pretrained(**self.config.vae_kwargs)
+            self.vae = AutoencoderClass.from_pretrained(**self.config.vae_kwargs)
             if (
                 self.vae is not None
                 and self.config.vae_enable_tiling
@@ -997,8 +1009,11 @@ class Trainer:
                 self.transformer = apply_bitfit_freezing(
                     unwrap_model(self.accelerator, self.transformer), self.config
                 )
+        self.enable_gradient_checkpointing()
 
+    def enable_gradient_checkpointing(self):
         if self.config.gradient_checkpointing:
+            logger.debug("Enabling gradient checkpointing.")
             if self.unet is not None:
                 unwrap_model(
                     self.accelerator, self.unet
@@ -1021,6 +1036,32 @@ class Trainer:
                 unwrap_model(
                     self.accelerator, self.text_encoder_2
                 ).gradient_checkpointing_enable()
+
+    def disable_gradient_checkpointing(self):
+        if self.config.gradient_checkpointing:
+            logger.debug("Disabling gradient checkpointing.")
+            if self.unet is not None:
+                unwrap_model(
+                    self.accelerator, self.unet
+                ).disable_gradient_checkpointing()
+            if self.transformer is not None and self.config.model_family != "smoldit":
+                unwrap_model(
+                    self.accelerator, self.transformer
+                ).disable_gradient_checkpointing()
+            if self.config.controlnet:
+                unwrap_model(
+                    self.accelerator, self.controlnet
+                ).disable_gradient_checkpointing()
+            if (
+                hasattr(self.config, "train_text_encoder")
+                and self.config.train_text_encoder
+            ):
+                unwrap_model(
+                    self.accelerator, self.text_encoder_1
+                ).gradient_checkpointing_disable()
+                unwrap_model(
+                    self.accelerator, self.text_encoder_2
+                ).gradient_checkpointing_disable()
 
     def _get_trainable_parameters(self):
         # Return just a list of the currently trainable parameters.
@@ -1579,6 +1620,7 @@ class Trainer:
             delattr(public_args, "weight_dtype")
             delattr(public_args, "base_weight_dtype")
             delattr(public_args, "vae_kwargs")
+            delattr(public_args, "sana_complex_human_instruction")
 
             # Hash the contents of public_args to reflect a deterministic ID for a single set of params:
             public_args_hash = hashlib.md5(
@@ -1613,6 +1655,98 @@ class Trainer:
         lr_scheduler = self.init_resume_checkpoint(lr_scheduler=lr_scheduler)
         self.init_post_load_freeze()
 
+    def enable_sageattention_inference(self):
+        # if the sageattention is inference-only, we'll enable it.
+        # if it's training only, we'll disable it.
+        # if it's inference+training, we leave it alone.
+        if (
+            "sageattention" not in self.config.attention_mechanism
+            or self.config.sageattention_usage == "training+inference"
+        ):
+            return
+        if self.config.sageattention_usage == "inference":
+            self.enable_sageattention()
+        if self.config.sageattention_usage == "training":
+            self.disable_sageattention()
+
+    def disable_sageattention_inference(self):
+        # if the sageattention is inference-only, we'll disable it.
+        # if it's training only, we'll enable it.
+        # if it's inference+training, we leave it alone.
+        if (
+            "sageattention" not in self.config.attention_mechanism
+            or self.config.sageattention_usage == "training+inference"
+        ):
+            return
+        if self.config.sageattention_usage == "inference":
+            self.disable_sageattention()
+        if self.config.sageattention_usage == "training":
+            self.enable_sageattention()
+
+    def disable_sageattention(self):
+        if "sageattention" not in self.config.attention_mechanism:
+            return
+
+        if (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention_sdpa")
+            and torch.nn.functional
+            != torch.nn.functional.scaled_dot_product_attention_sdpa
+        ):
+            logger.info("Disabling SageAttention.")
+            setattr(
+                torch.nn.functional,
+                "scaled_dot_product_attention",
+                torch.nn.functional.scaled_dot_product_attention_sdpa,
+            )
+
+    def enable_sageattention(self):
+        if "sageattention" not in self.config.attention_mechanism:
+            return
+
+        # we'll try and load SageAttention and overload pytorch's sdpa function.
+        try:
+            logger.info("Enabling SageAttention.")
+            from sageattention import (
+                sageattn,
+                sageattn_qk_int8_pv_fp16_triton,
+                sageattn_qk_int8_pv_fp16_cuda,
+                sageattn_qk_int8_pv_fp8_cuda,
+            )
+
+            sageattn_functions = {
+                "sageattention": sageattn,
+                "sageattention-int8-fp16-triton": sageattn_qk_int8_pv_fp16_triton,
+                "sageattention-int8-fp16-cuda": sageattn_qk_int8_pv_fp16_cuda,
+                "sageattention-int8-fp8-cuda": sageattn_qk_int8_pv_fp8_cuda,
+            }
+            # store the old SDPA for validations to use during VAE decode
+            if not hasattr(torch.nn.functional, "scaled_dot_product_attention_sdpa"):
+                setattr(
+                    torch.nn.functional,
+                    "scaled_dot_product_attention_sdpa",
+                    torch.nn.functional.scaled_dot_product_attention,
+                )
+            torch.nn.functional.scaled_dot_product_attention = sageattn_functions.get(
+                self.config.attention_mechanism, "sageattention"
+            )
+            if not hasattr(torch.nn.functional, "scaled_dot_product_attention_sage"):
+                setattr(
+                    torch.nn.functional,
+                    "scaled_dot_product_attention_sage",
+                    torch.nn.functional.scaled_dot_product_attention,
+                )
+
+            if "training" in self.config.sageattention_usage:
+                logger.warning(
+                    f"Using {self.config.attention_mechanism} for attention calculations during training. Your attention layers will not be trained. To disable SageAttention, remove or set --attention_mechanism to a different value."
+                )
+        except ImportError as e:
+            logger.error(
+                "Could not import SageAttention. Please install it to use this --attention_mechanism=sageattention."
+            )
+            logger.error(repr(e))
+            sys.exit(1)
+
     def move_models(self, destination: str = "accelerator"):
         target_device = "cpu"
         if destination == "accelerator":
@@ -1636,8 +1770,17 @@ class Trainer:
                     target_device, dtype=self.config.weight_dtype
                 )
             )
+
         if (
-            self.config.enable_xformers_memory_efficient_attention
+            "sageattention" in self.config.attention_mechanism
+            and "training" in self.config.sageattention_usage
+        ):
+            logger.info(
+                "Using SageAttention for training. This is an unsupported, experimental configuration."
+            )
+            self.enable_sageattention()
+        elif (
+            self.config.attention_mechanism == "xformers"
             and self.config.model_family
             not in [
                 "sd3",
@@ -1661,11 +1804,14 @@ class Trainer:
                 raise ValueError(
                     "xformers is not available. Make sure it is installed correctly"
                 )
-        elif self.config.enable_xformers_memory_efficient_attention:
+        elif self.config.attention_mechanism == "xformers":
             logger.warning(
                 "xformers is not enabled, as it is incompatible with this model type."
+                " Falling back to diffusers attention mechanism (Pytorch SDPA)."
+                " Alternatively, provide --attention_mechanism=sageattention for a more efficient option on CUDA systems."
             )
             self.config.enable_xformers_memory_efficient_attention = False
+            self.config.attention_mechanism = "diffusers"
 
         if self.config.controlnet:
             self.controlnet.train()
@@ -1737,7 +1883,7 @@ class Trainer:
         initial_msg += f"\n-  Total optimization steps = {self.config.max_train_steps}"
         if self.state["global_step"] > 1:
             initial_msg += f"\n  - Steps completed: {self.state['global_step']}"
-        initial_msg += f"\n-  Total optimization steps remaining = {max(0, self.config.total_steps_remaining_at_start)}"
+        initial_msg += f"\n-  Total optimization steps remaining = {max(0, getattr(self.config, 'total_steps_remaining_at_start', self.config.max_train_steps))}"
         logger.info(initial_msg)
         self._send_webhook_msg(message=initial_msg)
         structured_data = {
@@ -1748,7 +1894,14 @@ class Trainer:
             "total_batch_size": self.config.total_batch_size,
             "micro_batch_size": self.config.train_batch_size,
             "current_step": self.state["global_step"],
-            "remaining_num_steps": max(0, self.config.total_steps_remaining_at_start),
+            "remaining_num_steps": max(
+                0,
+                getattr(
+                    self.config,
+                    "total_steps_remaining_at_start",
+                    self.config.max_train_steps,
+                ),
+            ),
         }
         self._send_webhook_raw(
             structured_data=structured_data, message_type="_train_initial_msg"
@@ -2009,7 +2162,21 @@ class Trainer:
                     ),
                     return_dict=False,
                 )[0]
+            elif self.config.model_family == "sana":
+                model_pred = self.transformer(
+                    noisy_latents.to(self.config.weight_dtype),
+                    encoder_hidden_states=encoder_hidden_states.to(
+                        self.config.weight_dtype
+                    ),
+                    encoder_attention_mask=batch["encoder_attention_mask"],
+                    timestep=timesteps,
+                    return_dict=False,
+                )[0]
             elif self.config.model_family == "pixart_sigma":
+                if noisy_latents.shape[1] != 4:
+                    raise ValueError(
+                        "Pixart Sigma models require a latent size of 4 channels. Ensure you are using the correct VAE cache path."
+                    )
                 model_pred = self.transformer(
                     noisy_latents,
                     encoder_hidden_states=encoder_hidden_states,
@@ -2074,17 +2241,17 @@ class Trainer:
 
         return model_pred
 
+    def _max_grad_value(self):
+        max_grad_value = float("-inf")  # Start with a very small number
+        for param in self._get_trainable_parameters():
+            if param.grad is not None:
+                max_grad_value = max(max_grad_value, param.grad.abs().max().item())
+
+        return max_grad_value
+
     def train(self):
         self.init_trackers()
         self._train_initial_msg()
-
-        if self.config.validation_on_startup and self.state["global_step"] <= 1:
-            # Just in Case.
-            self.mark_optimizer_eval()
-            # normal run-of-the-mill validation on startup.
-            if self.validation is not None:
-                self.validation.run_validations(validation_type="base_model", step=0)
-
         self.mark_optimizer_train()
 
         # Only show the progress bar once on each machine.
@@ -2562,7 +2729,7 @@ class Trainer:
                         avg_loss.item() / self.config.gradient_accumulation_steps
                     )
                     # Backpropagate
-                    grad_norm = None
+                    self.grad_norm = None
                     if not self.config.disable_accelerator:
                         training_logger.debug("Backwards pass.")
                         self.accelerator.backward(loss)
@@ -2582,9 +2749,24 @@ class Trainer:
                             and self.config.max_grad_norm > 0
                         ):
                             # StableAdamW does not need clipping, similar to Adafactor.
-                            grad_norm = self.accelerator.clip_grad_norm_(
-                                self.params_to_optimize, self.config.max_grad_norm
-                            )
+                            if self.config.grad_clip_method == "norm":
+                                self.grad_norm = self.accelerator.clip_grad_norm_(
+                                    self._get_trainable_parameters(),
+                                    self.config.max_grad_norm,
+                                )
+                            elif self.config.use_deepspeed_optimizer:
+                                # deepspeed can only do norm clipping (internally)
+                                pass
+                            elif self.config.grad_clip_method == "value":
+                                self.grad_norm = self._max_grad_value()
+                                self.accelerator.clip_grad_value_(
+                                    self._get_trainable_parameters(),
+                                    self.config.max_grad_norm,
+                                )
+                            else:
+                                raise ValueError(
+                                    f"Unknown grad clip method: {self.config.grad_clip_method}. Supported methods: value, norm"
+                                )
                         training_logger.debug("Stepping components forward.")
                         if self.config.optimizer_release_gradients:
                             step_offset = 0  # simpletuner indexes steps from 1.
@@ -2630,8 +2812,11 @@ class Trainer:
                         guidance_values = torch.tensor(self.guidance_values_list).mean()
                         wandb_logs["mean_cfg"] = guidance_values.item()
                         self.guidance_values_list = []
-                    if grad_norm is not None:
-                        wandb_logs["grad_norm"] = grad_norm
+                    if self.grad_norm is not None:
+                        if self.config.grad_clip_method == "norm":
+                            wandb_logs["grad_norm"] = self.grad_norm
+                        elif self.config.grad_clip_method == "value":
+                            wandb_logs["grad_absmax"] = self.grad_norm
                     if self.validation is not None and hasattr(
                         self.validation, "evaluation_result"
                     ):
@@ -2799,15 +2984,24 @@ class Trainer:
                     "step_loss": loss.detach().item(),
                     "lr": float(self.lr),
                 }
-                if "mean_cfg" in wandb_logs:
-                    logs["mean_cfg"] = wandb_logs["mean_cfg"]
+                if self.grad_norm is not None:
+                    if self.config.grad_clip_method == "norm":
+                        logs["grad_norm"] = float(self.grad_norm.clone().detach())
+                    elif self.config.grad_clip_method == "value":
+                        logs["grad_absmax"] = self.grad_norm
 
                 progress_bar.set_postfix(**logs)
                 self.mark_optimizer_eval()
                 if self.validation is not None:
+                    if self.validation.would_validate():
+                        self.enable_sageattention_inference()
+                        self.disable_gradient_checkpointing()
                     self.validation.run_validations(
                         validation_type="intermediary", step=step
                     )
+                    if self.validation.would_validate():
+                        self.disable_sageattention_inference()
+                        self.enable_gradient_checkpointing()
                 self.mark_optimizer_train()
                 if (
                     self.config.push_to_hub
@@ -2856,12 +3050,16 @@ class Trainer:
         if self.accelerator.is_main_process:
             self.mark_optimizer_eval()
             if self.validation is not None:
+                self.enable_sageattention_inference()
+                self.disable_gradient_checkpointing()
                 validation_images = self.validation.run_validations(
                     validation_type="final",
                     step=self.state["global_step"],
                     force_evaluation=True,
                     skip_execution=True,
                 ).validation_images
+                # we don't have to do this but we will anyway.
+                self.disable_sageattention_inference()
             if self.unet is not None:
                 self.unet = unwrap_model(self.accelerator, self.unet)
             if self.transformer is not None:
@@ -3139,6 +3337,27 @@ class Trainer:
                         ),
                         transformer=self.transformer,
                         scheduler=None,
+                    )
+
+                elif self.config.model_family == "sana":
+                    from diffusers import SanaPipeline
+
+                    self.pipeline = SanaPipeline.from_pretrained(
+                        self.config.pretrained_model_name_or_path,
+                        text_encoder=self.text_encoder_1
+                        or (
+                            self.text_encoder_cls_1.from_pretrained(
+                                self.config.pretrained_model_name_or_path,
+                                subfolder="text_encoder",
+                                revision=self.config.revision,
+                                variant=self.config.variant,
+                            )
+                            if self.config.save_text_encoder
+                            else None
+                        ),
+                        tokenizer=self.tokenizer_1,
+                        vae=self.vae,
+                        transformer=self.transformer,
                     )
 
                 else:

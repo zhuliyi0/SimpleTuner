@@ -22,6 +22,7 @@ model_classes = {
         "kolors",
         "sd3",
         "legacy",
+        "sana",
     ],
     "lora": ["flux", "sdxl", "kolors", "sd3", "legacy"],
     "controlnet": ["sdxl", "legacy"],
@@ -35,6 +36,7 @@ default_models = {
     "terminus": "ptx0/terminus-xl-velocity-v2",
     "sd3": "stabilityai/stable-diffusion-3.5-large",
     "legacy": "stabilityai/stable-diffusion-2-1-base",
+    "sana": "terminusresearch/sana-1.6b-1024px",
 }
 
 default_cfg = {
@@ -44,6 +46,7 @@ default_cfg = {
     "kolors": 5.0,
     "terminus": 8.0,
     "sd3": 5.0,
+    "sana": 3.8,
 }
 
 model_labels = {
@@ -54,6 +57,7 @@ model_labels = {
     "terminus": "Terminus",
     "sdxl": "Stable Diffusion XL",
     "legacy": "Stable Diffusion",
+    "sana": "Sana",
 }
 
 lora_ranks = [1, 16, 64, 128, 256]
@@ -429,7 +433,36 @@ def configure_env():
         ).lower()
         == "y"
     )
-    report_to_str = ""
+
+    env_contents["--attention_mechanism"] = "diffusers"
+    use_sageattention = (
+        prompt_user(
+            "Would you like to use SageAttention for image validation generation? (y/[n])",
+            "n",
+        ).lower()
+        == "y"
+    )
+    if use_sageattention:
+        env_contents["--attention_mechanism"] = "sageattention"
+        env_contents["--sageattention_usage"] = "inference"
+        use_sageattention_training = (
+            prompt_user(
+                (
+                    "Would you like to use SageAttention to cover the forward and backward pass during training?"
+                    " This has the undesirable consequence of leaving the attention layers untrained,"
+                    " as SageAttention lacks the capability to fully track gradients through quantisation."
+                    " If you are not training the attention layers for some reason, this may not matter and"
+                    " you can safely enable this. For all other use-cases, reconsideration and caution are warranted."
+                ),
+                "n",
+            ).lower()
+            == "y"
+        )
+        if use_sageattention_training:
+            env_contents["--sageattention_usage"] = "both"
+
+    # properly disable wandb/tensorboard/comet_ml etc by default
+    report_to_str = "none"
     if report_to_wandb or report_to_tensorboard:
         tracker_project_name = prompt_user(
             "Enter the name of your Weights & Biases project", f"{model_type}-training"
@@ -440,17 +473,17 @@ def configure_env():
             f"simpletuner-{model_type}",
         )
         env_contents["--tracker_run_name"] = tracker_run_name
-        report_to_str = None
         if report_to_wandb:
             report_to_str = "wandb"
         if report_to_tensorboard:
-            if report_to_wandb:
+            if report_to_str != "none":
+                # report to both WandB and Tensorboard if the user wanted.
                 report_to_str += ","
             else:
+                # remove 'none' from the option
                 report_to_str = ""
             report_to_str += "tensorboard"
-        if report_to_str:
-            env_contents["--report_to"] = report_to_str
+    env_contents["--report_to"] = report_to_str
 
     print_config(env_contents, extra_args)
 
@@ -514,11 +547,24 @@ def configure_env():
         )
     )
     env_contents["--gradient_checkpointing"] = "true"
+    if env_contents["--model_family"] in ["sdxl", "flux", "sd3", "sana"]:
+        gradient_checkpointing_interval = prompt_user(
+            "Would you like to configure a gradient checkpointing interval? A value larger than 1 will increase VRAM usage but speed up training by skipping checkpoint creation every Nth layer, and a zero will disable this feature.",
+            0,
+        )
+        try:
+            if int(gradient_checkpointing_interval) > 1:
+                env_contents["--gradient_checkpointing_interval"] = int(
+                    gradient_checkpointing_interval
+                )
+        except:
+            print("Could not parse gradient checkpointing interval. Not enabling.")
+            pass
 
     env_contents["--caption_dropout_probability"] = float(
         prompt_user(
-            "Set the caption dropout rate, or use 0.0 to disable it. Dropout is not recommended for LoRA/LyCORIS training unless you are training for style transfer.",
-            "0.0" if any([use_lora, use_lycoris]) else "0.1",
+            "Set the caption dropout rate, or use 0.0 to disable it. Dropout might be a good idea to disable for Flux training, but experimentation is warranted.",
+            "0.05" if any([use_lora, use_lycoris]) else "0.1",
         )
     )
 

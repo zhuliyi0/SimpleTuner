@@ -1,4 +1,5 @@
 import torch
+import diffusers
 import os
 import wandb
 import logging
@@ -25,6 +26,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 from helpers.multiaspect.image import MultiaspectImage
 from helpers.image_manipulation.brightness import calculate_luminance
 from PIL import Image, ImageDraw, ImageFont
+from diffusers import SanaPipeline
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.environ.get("SIMPLETUNER_LOG_LEVEL") or "INFO")
@@ -47,6 +49,7 @@ SCHEDULER_NAME_MAP = {
     "unipc": UniPCMultistepScheduler,
     "ddim": DDIMScheduler,
     "ddpm": DDPMScheduler,
+    "sana": FlowMatchEulerDiscreteScheduler,
 }
 
 import logging
@@ -249,13 +252,16 @@ def prepare_validation_prompt_list(args, embed_cache):
                 validation_negative_prompt_embeds,
                 None,
             )
-        elif model_type == "pixart_sigma" or model_type == "smoldit":
+        elif (
+            model_type == "pixart_sigma"
+            or model_type == "smoldit"
+            or model_type == "sana"
+        ):
             # we use the legacy encoder but we return no pooled embeds.
-            validation_negative_prompt_embeds = (
-                embed_cache.compute_embeddings_for_prompts(
-                    [StateTracker.get_args().validation_negative_prompt],
-                    load_from_cache=False,
-                )
+            validation_negative_prompt_embeds = embed_cache.compute_embeddings_for_prompts(
+                [StateTracker.get_args().validation_negative_prompt],
+                load_from_cache=False,
+                is_negative_prompt=True,  # sana needs this to disable Complex Human Instruction on negative embed generation
             )
 
             return (
@@ -510,12 +516,21 @@ class Validation:
         logger.debug(
             f"Was the VAE loaded? {precached_vae if precached_vae is None else 'Yes'}"
         )
-        self.vae = precached_vae or AutoencoderKL.from_pretrained(
-            vae_path,
-            subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-            revision=args.revision,
-            force_upcast=False,
-        ).to(self.inference_device)
+        if self.args.model_family == "sana":
+            from diffusers import AutoencoderDC as AutoencoderClass
+        else:
+            from diffusers import AutoencoderKL as AutoencoderClass
+        self.vae = precached_vae
+        if self.vae is None:
+            logger.info(f"Initialising {AutoencoderClass}")
+            self.vae = AutoencoderClass.from_pretrained(
+                vae_path,
+                subfolder=(
+                    "vae" if args.pretrained_vae_model_name_or_path is None else None
+                ),
+                revision=args.revision,
+                force_upcast=False,
+            ).to(self.inference_device)
         StateTracker.set_vae(self.vae)
 
         return self.vae
@@ -606,6 +621,10 @@ class Validation:
             from helpers.models.smoldit import SmolDiTPipeline
 
             return SmolDiTPipeline
+        elif model_type == "sana":
+            from diffusers import SanaPipeline
+
+            return SanaPipeline
         else:
             raise NotImplementedError(
                 f"Model type {model_type} not implemented for validation."
@@ -670,13 +689,14 @@ class Validation:
             StateTracker.get_model_family() == "legacy"
             or StateTracker.get_model_family() == "pixart_sigma"
             or StateTracker.get_model_family() == "smoldit"
+            or StateTracker.get_model_family() == "sana"
         ):
             self.validation_negative_pooled_embeds = None
             current_validation_pooled_embeds = None
             current_validation_prompt_embeds = (
                 self.embed_cache.compute_embeddings_for_prompts([validation_prompt])
             )
-            if StateTracker.get_model_family() in ["pixart_sigma", "smoldit"]:
+            if StateTracker.get_model_family() in ["pixart_sigma", "smoldit", "sana"]:
                 current_validation_prompt_embeds, current_validation_prompt_mask = (
                     current_validation_prompt_embeds
                 )
@@ -724,6 +744,7 @@ class Validation:
         if (
             StateTracker.get_model_family() == "pixart_sigma"
             or StateTracker.get_model_family() == "smoldit"
+            or StateTracker.get_model_family() == "sana"
             or (
                 StateTracker.get_model_family() == "flux"
                 and StateTracker.get_args().flux_attention_masked_training
@@ -745,7 +766,11 @@ class Validation:
         return os.path.join(self.args.output_dir, "benchmarks", benchmark)
 
     def stitch_benchmark_image(
-        self, validation_image_result, benchmark_image, separator_width=5, labels=["base model", "checkpoint"]
+        self,
+        validation_image_result,
+        benchmark_image,
+        separator_width=5,
+        labels=["base model", "checkpoint"],
     ):
         """
         For each image, make a new canvas and place it side by side with its equivalent from {self.validation_image_inputs}
@@ -754,7 +779,9 @@ class Validation:
         """
 
         # Calculate new dimensions
-        new_width = benchmark_image.size[0] + validation_image_result.size[0] + separator_width
+        new_width = (
+            benchmark_image.size[0] + validation_image_result.size[0] + separator_width
+        )
         new_height = benchmark_image.size[1]
 
         # Create a new image with a white background
@@ -877,6 +904,18 @@ class Validation:
         self.global_step = StateTracker.get_global_step()
         self.global_resume_step = StateTracker.get_global_resume_step() or 1
 
+    def would_validate(
+        self,
+        step: int = 0,
+        validation_type="intermediary",
+        force_evaluation: bool = False,
+    ):
+        # a wrapper for should_perform_validation that can run in the training loop
+        self._update_state()
+        return self.should_perform_validation(
+            step, self.validation_prompts, validation_type
+        ) or (step == 0 and validation_type == "base_model")
+
     def run_validations(
         self,
         step: int = 0,
@@ -905,6 +944,7 @@ class Validation:
 
         if self.accelerator.is_main_process or self.deepspeed:
             logger.debug("Starting validation process...")
+            diffusers.utils.logging._tqdm_active = False
             self.setup_pipeline(validation_type)
             if self.pipeline is None:
                 logger.error(
@@ -935,11 +975,14 @@ class Validation:
         )
 
     def setup_scheduler(self):
-        if self.args.validation_noise_scheduler is None:
-            return
-        if self.flow_matching:
+        if self.flow_matching and not self.args.model_family == "sana":
             # NO TOUCHIE FOR FLOW-MATCHING.
-            # Touchie for diffusion though.
+            # Touchie for sana though. It needs a new scheduler on every inference.
+            return
+        elif self.args.model_family == "sana":
+            self.args.validation_noise_scheduler = "sana"
+
+        if self.args.validation_noise_scheduler is None:
             return
 
         scheduler_args = {}
@@ -982,14 +1025,14 @@ class Validation:
                 "text_encoder": self.text_encoder_1,
                 "tokenizer": self.tokenizer_1,
                 "vae": self.vae,
-                "safety_checker": None,
             }
+            if self.args.model_family in ["legacy"]:
+                extra_pipeline_kwargs["safety_checker"] = None
             if self.args.model_family in ["sd3", "sdxl", "flux"]:
                 extra_pipeline_kwargs["text_encoder_2"] = None
             if self.args.model_family in ["sd3"]:
                 extra_pipeline_kwargs["text_encoder_3"] = None
             if type(pipeline_cls) is StableDiffusionXLPipeline:
-                del extra_pipeline_kwargs["safety_checker"]
                 del extra_pipeline_kwargs["text_encoder"]
                 del extra_pipeline_kwargs["tokenizer"]
                 if validation_type == "final":
@@ -1051,6 +1094,8 @@ class Validation:
 
             if self.vae is None or not hasattr(self.vae, "device"):
                 extra_pipeline_kwargs["vae"] = self.init_vae()
+            else:
+                logger.info(f"Found VAE: {self.vae.config}")
             if (
                 "vae" in extra_pipeline_kwargs
                 and extra_pipeline_kwargs.get("vae") is not None
@@ -1168,9 +1213,11 @@ class Validation:
                 )
             self.validation_prompt_dict[shortname] = prompt
             logger.debug(f"Processing validation for prompt: {prompt}")
-            stitched_validation_images, checkpoint_validation_images, ema_validation_images = (
-                self.validate_prompt(prompt, shortname, validation_input_image)
-            )
+            (
+                stitched_validation_images,
+                checkpoint_validation_images,
+                ema_validation_images,
+            ) = self.validate_prompt(prompt, shortname, validation_input_image)
             validation_images.update(stitched_validation_images)
             self._save_images(validation_images, shortname, prompt)
             logger.debug(f"Completed generating image: {prompt}")
@@ -1269,6 +1316,7 @@ class Validation:
                 "kolors",
                 "flux",
                 "sd3",
+                "sana",
             ]:
                 extra_validation_kwargs["guidance_rescale"] = (
                     self.args.validation_guidance_rescale
@@ -1339,9 +1387,15 @@ class Validation:
                 if StateTracker.get_model_family() == "flux":
                     if "negative_prompt" in pipeline_kwargs:
                         del pipeline_kwargs["negative_prompt"]
+                if self.args.model_family == "sana":
+                    pipeline_kwargs["complex_human_instruction"] = (
+                        self.args.sana_complex_human_instruction
+                    )
+
                 if (
                     StateTracker.get_model_family() == "pixart_sigma"
                     or StateTracker.get_model_family() == "smoldit"
+                    or StateTracker.get_model_family() == "sana"
                 ):
                     if pipeline_kwargs.get("negative_prompt") is not None:
                         del pipeline_kwargs["negative_prompt"]
@@ -1364,15 +1418,17 @@ class Validation:
                         )
                     if current_validation_type == "ema":
                         self.enable_ema_for_inference()
-                    all_validation_type_results[current_validation_type] = self.pipeline(
-                        **pipeline_kwargs
-                    ).images
+                    all_validation_type_results[current_validation_type] = (
+                        self.pipeline(**pipeline_kwargs).images
+                    )
                     if current_validation_type == "ema":
                         self.disable_ema_for_inference()
 
                 # retrieve the default image result for stitching to controlnet inputs.
                 ema_image_results = all_validation_type_results.get("ema")
-                validation_image_results = all_validation_type_results.get("checkpoint", ema_image_results)
+                validation_image_results = all_validation_type_results.get(
+                    "checkpoint", ema_image_results
+                )
                 original_validation_image_results = validation_image_results
                 benchmark_image = None
                 if self.args.controlnet:
@@ -1387,7 +1443,9 @@ class Validation:
                         validation_shortname, resolution
                     )
                     if benchmark_image is not None:
-                        for idx, validation_image in enumerate(validation_image_results):
+                        for idx, validation_image in enumerate(
+                            validation_image_results
+                        ):
                             validation_image_results[idx] = self.stitch_benchmark_image(
                                 validation_image_result=validation_image,
                                 benchmark_image=benchmark_image,
@@ -1396,9 +1454,13 @@ class Validation:
                 checkpoint_validation_images[validation_shortname].extend(
                     original_validation_image_results
                 )
-                stitched_validation_images[validation_shortname].extend(validation_image_results)
+                stitched_validation_images[validation_shortname].extend(
+                    validation_image_results
+                )
                 if self.args.use_ema:
-                    ema_validation_images[validation_shortname].extend(ema_image_results)
+                    ema_validation_images[validation_shortname].extend(
+                        ema_image_results
+                    )
 
             except Exception as e:
                 import traceback
@@ -1407,15 +1469,31 @@ class Validation:
                     f"Error generating validation image: {e}, {traceback.format_exc()}"
                 )
                 continue
-        if self.args.use_ema and self.args.ema_validation == "comparison" and benchmark_image is not None:
-            for idx, validation_image in enumerate(stitched_validation_images[validation_shortname]):
-                stitched_validation_images[validation_shortname][idx] = self.stitch_benchmark_image(
-                    validation_image_result=ema_validation_images[validation_shortname][idx],
-                    benchmark_image=stitched_validation_images[validation_shortname][idx],
-                    labels=[None, "EMA"]
+        if (
+            self.args.use_ema
+            and self.args.ema_validation == "comparison"
+            and benchmark_image is not None
+        ):
+            for idx, validation_image in enumerate(
+                stitched_validation_images[validation_shortname]
+            ):
+                stitched_validation_images[validation_shortname][idx] = (
+                    self.stitch_benchmark_image(
+                        validation_image_result=ema_validation_images[
+                            validation_shortname
+                        ][idx],
+                        benchmark_image=stitched_validation_images[
+                            validation_shortname
+                        ][idx],
+                        labels=[None, "EMA"],
+                    )
                 )
 
-        return stitched_validation_images, checkpoint_validation_images, ema_validation_images
+        return (
+            stitched_validation_images,
+            checkpoint_validation_images,
+            ema_validation_images,
+        )
 
     def _save_images(self, validation_images, validation_shortname, validation_prompt):
         validation_img_idx = 0
@@ -1539,19 +1617,25 @@ class Validation:
 
     def enable_ema_for_inference(self, pipeline=None):
         if self.ema_enabled:
-            logger.info("EMA already enabled. Not enabling EMA.")
+            logger.debug("EMA already enabled. Not enabling EMA.")
             return
         if self.args.use_ema:
-            logger.info("Enabling EMA.")
+            logger.debug("Enabling EMA.")
             self.ema_enabled = True
             if self.args.model_type == "lora":
                 if self.args.lora_type.lower() == "lycoris":
-                    logger.info("Setting Lycoris multiplier to 1.0")
+                    logger.debug("Setting Lycoris multiplier to 1.0")
                     self.accelerator._lycoris_wrapped_network.set_multiplier(1.0)
-                    logger.info("Storing Lycoris weights for later recovery.")
-                    self.ema_model.store(self.accelerator._lycoris_wrapped_network.parameters())
-                    logger.info("Storing the EMA weights into the Lycoris adapter for inference.")
-                    self.ema_model.copy_to(self.accelerator._lycoris_wrapped_network.parameters())
+                    logger.debug("Storing Lycoris weights for later recovery.")
+                    self.ema_model.store(
+                        self.accelerator._lycoris_wrapped_network.parameters()
+                    )
+                    logger.debug(
+                        "Storing the EMA weights into the Lycoris adapter for inference."
+                    )
+                    self.ema_model.copy_to(
+                        self.accelerator._lycoris_wrapped_network.parameters()
+                    )
                 elif self.args.lora_type.lower() == "standard":
                     _trainable_parameters = [
                         x for x in self._primary_model().parameters() if x.requires_grad
@@ -1562,45 +1646,49 @@ class Validation:
                 # if self.args.ema_device != "accelerator":
                 #     logger.info("Moving checkpoint to CPU for storage.")
                 #     self._primary_model().to("cpu")
-                logger.info("Storing EMA weights for later recovery.")
+                logger.debug("Storing EMA weights for later recovery.")
                 self.ema_model.store(self.trainable_parameters())
-                logger.info("Storing the EMA weights into the model for inference.")
+                logger.debug("Storing the EMA weights into the model for inference.")
                 self.ema_model.copy_to(self.trainable_parameters())
             # if self.args.ema_device != "accelerator":
-            #     logger.info("Moving checkpoint to CPU for storage.")
+            #     logger.debug("Moving checkpoint to CPU for storage.")
             #     self._primary_model().to("cpu")
-            #     logger.info("Moving EMA weights to GPU for inference.")
+            #     logger.debug("Moving EMA weights to GPU for inference.")
             #     self.ema_model.to(self.inference_device)
         else:
-            logger.info(
+            logger.debug(
                 "Skipping EMA model setup for validation, as we are not using EMA."
             )
 
     def disable_ema_for_inference(self):
         if not self.ema_enabled:
-            logger.info("EMA was not enabled. Not disabling EMA.")
+            logger.debug("EMA was not enabled. Not disabling EMA.")
             return
         if self.args.use_ema:
-            logger.info("Disabling EMA.")
+            logger.debug("Disabling EMA.")
             self.ema_enabled = False
-            if self.args.model_type == "lora" and self.args.lora_type.lower() == "lycoris":
-                logger.info("Setting Lycoris network multiplier to 1.0.")
+            if (
+                self.args.model_type == "lora"
+                and self.args.lora_type.lower() == "lycoris"
+            ):
+                logger.debug("Setting Lycoris network multiplier to 1.0.")
                 self.accelerator._lycoris_wrapped_network.set_multiplier(1.0)
-                logger.info("Restoring Lycoris weights.")
-                self.ema_model.restore(self.accelerator._lycoris_wrapped_network.parameters())
+                logger.debug("Restoring Lycoris weights.")
+                self.ema_model.restore(
+                    self.accelerator._lycoris_wrapped_network.parameters()
+                )
             else:
-                logger.info("Restoring trainable parameters.")
+                logger.debug("Restoring trainable parameters.")
                 self.ema_model.restore(self.trainable_parameters())
             if self.args.ema_device != "accelerator":
-                logger.info("Moving EMA weights to CPU for storage.")
+                logger.debug("Moving EMA weights to CPU for storage.")
                 self.ema_model.to(self.args.ema_device)
                 self._primary_model().to(self.inference_device)
 
         else:
-            logger.info(
+            logger.debug(
                 "Skipping EMA model restoration for validation, as we are not using EMA."
             )
-
 
     def finalize_validation(self, validation_type):
         """Cleans up and restores original state if necessary."""
